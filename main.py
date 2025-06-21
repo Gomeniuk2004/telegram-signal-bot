@@ -1,101 +1,67 @@
-
+import os
+import logging
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 import yfinance as yf
 import pandas as pd
-from ta.trend import EMAIndicator
-from ta.momentum import RSIIndicator
-from ta.volatility import BollingerBands
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
-from datetime import datetime
+import ta
 
-TOKEN = "8091244631:AAHZRqn2bY3Ow2zH2WNk0J92mar6D0MgfLw"
+# Отримуємо токен з Environment Variable
+TOKEN = os.environ.get("BOT_TOKEN")
 
-user_settings = {}
-history = []
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
-def fetch_data(pair: str, interval: str = "1m", limit: int = 100):
-    symbol = pair.replace('/', '')
-    try:
-        data = yf.download(symbol, period="1d", interval=interval)
-        return data.tail(limit)
-    except Exception as e:
-        print(f"Помилка завантаження даних: {e}")
-        return None
+PAIRS = ['EURUSD=X', 'GBPUSD=X', 'USDJPY=X', 'BTC-USD']
+TIMEFRAMES = {'1Хв': '1m', '3Хв': '3m', '5Хв': '5m'}
 
-def generate_signal(df):
-    if df is None or df.empty or 'Close' not in df.columns:
-        return "⚠️ Дані відсутні або некоректні"
-
-    close = df['Close']
-    rsi = RSIIndicator(close, window=14).rsi()
-    ema = EMAIndicator(close, window=20).ema_indicator()
-    bb = BollingerBands(close)
-    upper = bb.bollinger_hband()
-    lower = bb.bollinger_lband()
-
-    last_close = close.iloc[-1]
-    last_rsi = rsi.iloc[-1]
-    last_ema = ema.iloc[-1]
-    last_upper = upper.iloc[-1]
-    last_lower = lower.iloc[-1]
-
-    if last_rsi < 30 and last_close > last_ema and last_close > last_lower:
-        return "⬆️ Buy (вгору на 2 хв)"
-    elif last_rsi > 70 and last_close < last_ema and last_close < last_upper:
-        return "⬇️ Sell (вниз на 2 хв)"
-    return "⏸ Немає чіткого сигналу"
+user_data = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("EUR/USD", callback_data='pair_EUR/USD')],
-        [InlineKeyboardButton("GBP/USD", callback_data='pair_GBP/USD')],
-        [InlineKeyboardButton("OTC EUR/USD", callback_data='pair_OTC EUR/USD')],
-        [InlineKeyboardButton("1 хв", callback_data='tf_1')],
-        [InlineKeyboardButton("3 хв", callback_data='tf_3')],
-        [InlineKeyboardButton("5 хв", callback_data='tf_5')],
-        [InlineKeyboardButton("📈 Отримати сигнал", callback_data='signal')],
-        [InlineKeyboardButton("📜 Історія", callback_data='history')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("📊 Виберіть валютну пару та таймфрейм:", reply_markup=reply_markup)
+    reply_markup = ReplyKeyboardMarkup([[p] for p in PAIRS], one_time_keyboard=True)
+    await update.message.reply_text("Оберіть валютну пару:", reply_markup=reply_markup)
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
 
-    if user_id not in user_settings:
-        user_settings[user_id] = {'pair': 'EUR/USD', 'tf': '1m'}
+    if text in PAIRS:
+        user_data[update.effective_user.id] = {'pair': text}
+        reply_markup = ReplyKeyboardMarkup([[k] for k in TIMEFRAMES.keys()], one_time_keyboard=True)
+        await update.message.reply_text("Оберіть таймфрейм:", reply_markup=reply_markup)
+    elif text in TIMEFRAMES:
+        pair = user_data.get(update.effective_user.id, {}).get('pair')
+        if not pair:
+            await update.message.reply_text("Спочатку оберіть валютну пару командою /start")
+            return
+        tf = TIMEFRAMES[text]
+        signal = get_signal(pair, tf)
+        result = f"📈 Сигнал для {pair} | Таймфрейм: {text}\n\n{signal}"
+        await update.message.reply_text(result)
+    else:
+        await update.message.reply_text("Будь ласка, оберіть валютну пару або таймфрейм з меню.")
 
-    data = query.data
-    if data.startswith("pair_"):
-        user_settings[user_id]['pair'] = data[5:]
-        await query.edit_message_text(f"✅ Обрана пара: {data[5:]}")
-    elif data.startswith("tf_"):
-        tf_map = {'1': '1m', '3': '3m', '5': '5m'}
-        user_settings[user_id]['tf'] = tf_map[data[3:]]
-        await query.edit_message_text(f"✅ Обраний таймфрейм: {data[3:]} хв")
-    elif data == "signal":
-        pair = user_settings[user_id]['pair']
-        tf = user_settings[user_id]['tf']
-        df = fetch_data(pair, interval=tf)
-        signal = generate_signal(df)
-        result = f"📈 Сигнал для {pair} | TF: {tf}
-Результат: {signal}"
-        history.append({
-            'user_id': user_id,
-            'pair': pair,
-            'tf': tf,
-            'signal': signal,
-            'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        })
-        await query.edit_message_text(result)
-    elif data == "history":
-        logs = [f"{h['time']} | {h['pair']} | {h['signal']}" for h in history[-5:] if h['user_id'] == user_id]
-        await query.edit_message_text("📜 Останні сигнали:
-" + "\n".join(logs) if logs else "Історія порожня.")
+def get_signal(pair, tf):
+    try:
+        df = yf.download(pair, period='1d', interval=tf)
+        df.dropna(inplace=True)
+        df['rsi'] = ta.momentum.RSIIndicator(df['Close']).rsi()
+        df['ema_fast'] = ta.trend.EMAIndicator(df['Close'], window=5).ema_indicator()
+        df['ema_slow'] = ta.trend.EMAIndicator(df['Close'], window=14).ema_indicator()
 
-app = ApplicationBuilder().token(TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CallbackQueryHandler(button))
-app.run_polling()
+        latest = df.iloc[-1]
+        if latest['rsi'] < 30 and latest['ema_fast'] > latest['ema_slow']:
+            return "🟢 Купити (UP)"
+        elif latest['rsi'] > 70 and latest['ema_fast'] < latest['ema_slow']:
+            return "🔴 Продати (DOWN)"
+        else:
+            return "⚪️ Нейтральний сигнал"
+    except Exception as e:
+        return f"⚠️ Помилка: {e}"
+
+if __name__ == '__main__':
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.run_polling()
