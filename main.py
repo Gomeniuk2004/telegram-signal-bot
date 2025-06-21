@@ -1,227 +1,140 @@
-import io
-import os
-import json
 import logging
-from datetime import datetime
-
-import yfinance as yf
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-
-from ta.momentum import RSIIndicator
-from ta.volatility import BollingerBands
-from ta.trend import EMAIndicator
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import os
+import asyncio
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    CallbackQueryHandler,
     ContextTypes,
+    CallbackQueryHandler,
 )
+import yfinance as yf
+import matplotlib.pyplot as plt
+import ta
+import datetime
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-
+# Вшитий токен і чат ID
 TOKEN = "8091244631:AAHZRqn2bY3Ow2zH2WNk0J92mar6D0MgfLw"
+chat_id = 992940966
 
-HISTORY_FILE = "signal_history.json"
+logging.basicConfig(level=logging.INFO)
+user_settings = {}
+history = []
 
-PAIRS = {
-    "EUR/USD": "EURUSD=X",
-    "USD/JPY": "USDJPY=X",
-    "GBP/USD": "GBPUSD=X",
-    "AUD/USD": "AUDUSD=X",
-    "USD/CAD": "USDCAD=X",
-    "USD/CHF": "USDCHF=X",
-    "NZD/USD": "NZDUSD=X",
-}
-
-TIMEFRAMES = {
+available_pairs = [
+    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCHF", "EURJPY",
+    "GBPJPY", "EURGBP", "NZDUSD", "USDCAD"
+]
+timeframes = {
     "1m": "1m",
     "3m": "3m",
     "5m": "5m"
 }
 
-def load_history():
-    if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    else:
-        return {}
 
-def save_history(history):
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
+def analyze_signal(data):
+    if len(data) < 20:
+        return "Недостатньо даних для аналізу", None
 
-def calculate_signal(df):
-    if df is None or df.empty:
-        return "Немає даних", "🟡"
+    rsi = ta.momentum.RSIIndicator(data['Close'], window=14).rsi()
+    ema = ta.trend.EMAIndicator(data['Close'], window=9).ema_indicator()
+    close_price = data['Close'].iloc[-1]
 
-    close = df["Close"]
-    rsi = RSIIndicator(close, window=14).rsi()
-    ema = EMAIndicator(close, window=21).ema_indicator()
-    bb = BollingerBands(close, window=20, window_dev=2)
-    bb_high = bb.bollinger_hband()
-    bb_low = bb.bollinger_lband()
+    signal = "Очікуйте"
+    if rsi.iloc[-1] < 30 and close_price > ema.iloc[-1]:
+        signal = "💚 Купити"
+    elif rsi.iloc[-1] > 70 and close_price < ema.iloc[-1]:
+        signal = "❤️ Продати"
 
-    last_close = close.iloc[-1]
-    last_rsi = rsi.iloc[-1]
-    last_ema = ema.iloc[-1]
-    last_bb_high = bb_high.iloc[-1]
-    last_bb_low = bb_low.iloc[-1]
+    return signal, (rsi.iloc[-1], ema.iloc[-1], close_price)
 
-    # Логіка сигналів
-    if last_rsi < 30 and last_close < last_bb_low and last_close > last_ema:
-        return "Купувати", "🟢"
-    elif last_rsi > 70 and last_close > last_bb_high and last_close < last_ema:
-        return "Продавати", "🔴"
-    else:
-        return "Тримати", "🟡"
 
-def generate_chart(df, pair_name):
-    plt.style.use('seaborn-darkgrid')
-    fig, ax = plt.subplots(figsize=(10, 6))
+def generate_plot(data, pair, tf):
+    plt.figure(figsize=(10, 4))
+    plt.plot(data['Close'], label='Ціна')
+    plt.title(f'{pair} ({tf})')
+    plt.xlabel('Час')
+    plt.ylabel('Ціна')
+    plt.grid()
+    plt.tight_layout()
+    filename = f'{pair}_{tf}.png'
+    plt.savefig(filename)
+    plt.close()
+    return filename
 
-    ax.plot(df.index, df['Close'], label='Close')
-    ax.plot(df.index, EMAIndicator(df['Close'], 21).ema_indicator(), label='EMA 21')
-
-    bb = BollingerBands(df['Close'], 20, 2)
-    ax.plot(df.index, bb.bollinger_hband(), label='BB High', linestyle='--', color='gray')
-    ax.plot(df.index, bb.bollinger_lband(), label='BB Low', linestyle='--', color='gray')
-
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-    ax.set_title(f'Графік {pair_name}')
-    ax.legend()
-    ax.set_xlabel('Час')
-    ax.set_ylabel('Ціна')
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png')
-    plt.close(fig)
-    buf.seek(0)
-    return buf
-
-def pairs_keyboard():
-    keyboard = []
-    row = []
-    for i, pair in enumerate(PAIRS.keys()):
-        row.append(InlineKeyboardButton(pair, callback_data=f"pair|{pair}"))
-        if (i + 1) % 3 == 0:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
-    return InlineKeyboardMarkup(keyboard)
-
-def timeframes_keyboard():
-    keyboard = [
-        [InlineKeyboardButton(tf, callback_data=f"timeframe|{tf}") for tf in TIMEFRAMES.keys()]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-user_selection = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Вибери валютну пару для отримання сигналу:",
-        reply_markup=pairs_keyboard()
-    )
+    keyboard = [[InlineKeyboardButton(pair, callback_data=f"pair_{pair}")]
+                for pair in available_pairs]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Оберіть валютну пару:", reply_markup=reply_markup)
 
-async def pair_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    pair_name = query.data.split("|")[1]
-
-    user_id = query.from_user.id
-    user_selection[user_id] = {"pair": pair_name}
-
-    await query.edit_message_text(
-        text=f"Обрана пара: {pair_name}\nВибери таймфрейм:",
-        reply_markup=timeframes_keyboard()
-    )
-
-async def timeframe_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    timeframe = query.data.split("|")[1]
     user_id = query.from_user.id
 
-    if user_id not in user_selection or "pair" not in user_selection[user_id]:
-        await query.edit_message_text("Спершу обери валютну пару командою /start")
-        return
+    if query.data.startswith("pair_"):
+        pair = query.data.split("_")[1]
+        user_settings[user_id] = {"pair": pair}
+        keyboard = [[InlineKeyboardButton(tf, callback_data=f"tf_{tf}")]
+                    for tf in timeframes]
+        markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(f"Обрано пару: {pair}\nТепер оберіть таймфрейм:", reply_markup=markup)
 
-    pair_name = user_selection[user_id]["pair"]
-    ticker = PAIRS[pair_name]
+    elif query.data.startswith("tf_"):
+        tf = query.data.split("_")[1]
+        pair = user_settings[user_id]["pair"]
+        user_settings[user_id]["timeframe"] = tf
 
-    await query.edit_message_text(f"Завантажую дані для {pair_name} з таймфреймом {timeframe}...")
+        await query.edit_message_text(f"📊 Отримую сигнал для {pair} ({tf})...")
 
-    try:
-        df = yf.download(ticker, period="1d", interval=timeframe)
-    except Exception as e:
-        await query.edit_message_text(f"Помилка завантаження даних: {e}")
-        return
+        ticker = yf.Ticker(pair + "=X")
+        interval = timeframes[tf]
+        now = datetime.datetime.utcnow()
+        past = now - datetime.timedelta(minutes=50)
+        df = ticker.history(start=past, end=now, interval=interval)
 
-    if df.empty:
-        await query.edit_message_text("Немає даних для обраної пари та таймфрейму.")
-        return
+        signal, data_points = analyze_signal(df)
+        filename = generate_plot(df, pair, tf)
 
-    signal_text, emoji = calculate_signal(df)
+        text = f"📈 Пара: {pair}\n⏱️ Таймфрейм: {tf}\n📉 Сигнал: {signal}"
+        if data_points:
+            rsi, ema, price = data_points
+            text += f"\nRSI: {rsi:.2f}\nEMA: {ema:.2f}\nЦіна: {price:.5f}"
 
-    history = load_history()
-    entry = {
-        "timestamp": datetime.now().isoformat(),
-        "user_id": user_id,
-        "pair": pair_name,
-        "timeframe": timeframe,
-        "signal": signal_text,
-    }
-    history.setdefault(str(user_id), []).append(entry)
-    save_history(history)
+        history.append({
+            "timestamp": now.strftime("%Y-%m-%d %H:%M"),
+            "pair": pair,
+            "tf": tf,
+            "signal": signal
+        })
 
-    chart = generate_chart(df, pair_name)
+        await context.bot.send_photo(chat_id=user_id, photo=open(filename, "rb"), caption=text)
+        os.remove(filename)
 
-    await context.bot.send_photo(
-        chat_id=user_id,
-        photo=chart,
-        caption=f"Сигнал для {pair_name} ({timeframe}): {emoji} {signal_text}"
-    )
 
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    history = load_history()
+async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not history:
+        await update.message.reply_text("Історія сигналів поки що порожня.")
+    else:
+        msg = "📜 Історія сигналів:\n\n"
+        for h in history[-10:]:
+            msg += f"{h['timestamp']} | {h['pair']} ({h['tf']}) — {h['signal']}\n"
+        await update.message.reply_text(msg)
 
-    user_history = history.get(str(user_id), [])
-    if not user_history:
-        await update.message.reply_text("Історія сигналів порожня.")
-        return
-
-    total = len(user_history)
-    buy_count = sum(1 for e in user_history if e["signal"] == "Купувати")
-    sell_count = sum(1 for e in user_history if e["signal"] == "Продавати")
-    hold_count = total - buy_count - sell_count
-
-    msg = (
-        f"Статистика сигналів:\n"
-        f"Всього: {total}\n"
-        f"Купувати: {buy_count}\n"
-        f"Продавати: {sell_count}\n"
-        f"Тримати: {hold_count}\n"
-    )
-    await update.message.reply_text(msg)
 
 async def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CallbackQueryHandler(pair_handler, pattern=r"^pair\|"))
-    app.add_handler(CallbackQueryHandler(timeframe_handler, pattern=r"^timeframe\|"))
+    app.add_handler(CommandHandler("history", history_handler))
+    app.add_handler(CallbackQueryHandler(button_handler))
 
-    print("Бот запущено")
+    logging.info("Бот запущено")
     await app.run_polling()
 
+
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
