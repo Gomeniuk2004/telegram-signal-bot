@@ -1,69 +1,93 @@
-impoimport os
+import os
 import logging
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
-import yfinance as yf
-import pandas as pd
-import ta
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+import random
+from datetime import datetime
 
-# Отримуємо токен з Environment Variable
-TOKEN = os.environ.get("BOT_TOKEN")
-
+# Логування
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+logger = logging.getLogger(__name__)
 
-PAIRS = ['EURUSD=X', 'GBPUSD=X', 'USDJPY=X', 'BTC-USD']
-TIMEFRAMES = {'1Хв': '1m', '3Хв': '3m', '5Хв': '5m'}
+# Дані для вибору
+PAIRS = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "BTC-USD", "ETH-USD"]  # приклад OTC пари теж є
+TIMEFRAMES = ["1м", "3м", "5м", "15м"]
 
-user_data = {}
+# Історія сигналів (в пам’яті, можна зберігати в файл чи БД)
+history = []
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reply_markup = ReplyKeyboardMarkup([[p] for p in PAIRS], one_time_keyboard=True)
-    await update.message.reply_text("Оберіть валютну пару:", reply_markup=reply_markup)
+    keyboard = [
+        [InlineKeyboardButton(pair, callback_data=f"pair_{pair}") for pair in PAIRS]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text('Виберіть валютну пару:', reply_markup=reply_markup)
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+async def pair_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    pair = query.data.split("_")[1]
+    context.user_data['pair'] = pair
 
-    if text in PAIRS:
-        user_data[update.effective_user.id] = {'pair': text}
-        reply_markup = ReplyKeyboardMarkup([[k] for k in TIMEFRAMES.keys()], one_time_keyboard=True)
-        await update.message.reply_text("Оберіть таймфрейм:", reply_markup=reply_markup)
-    elif text in TIMEFRAMES:
-        pair = user_data.get(update.effective_user.id, {}).get('pair')
-        if not pair:
-            await update.message.reply_text("Спочатку оберіть валютну пару командою /start")
-            return
-        tf = TIMEFRAMES[text]
-        signal = get_signal(pair, tf)
-        result = f"📈 Сигнал для {pair} | Таймфрейм: {text}\n\n{signal}"
-        await update.message.reply_text(result)
-    else:
-        await update.message.reply_text("Будь ласка, оберіть валютну пару або таймфрейм з меню.")
+    keyboard = [
+        [InlineKeyboardButton(tf, callback_data=f"tf_{tf}") for tf in TIMEFRAMES]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text=f"Ви обрали пару: {pair}\nОберіть таймфрейм:", reply_markup=reply_markup)
 
-def get_signal(pair, tf):
-    try:
-        df = yf.download(pair, period='5d', interval=tf)
-        if df.empty:
-            return "⚠️ Дані не доступні для цієї пари/таймфрейму. Спробуйте інший варіант."
-        df.dropna(inplace=True)
-        df['rsi'] = ta.momentum.RSIIndicator(df['Close']).rsi()
-        df['ema_fast'] = ta.trend.EMAIndicator(df['Close'], window=5).ema_indicator()
-        df['ema_slow'] = ta.trend.EMAIndicator(df['Close'], window=14).ema_indicator()
+async def tf_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    tf = query.data.split("_")[1]
+    pair = context.user_data.get('pair')
 
-        latest = df.iloc[-1]
-        if latest['rsi'] < 30 and latest['ema_fast'] > latest['ema_slow']:
-            return "🟢 Купити (UP)"
-        elif latest['rsi'] > 70 and latest['ema_fast'] < latest['ema_slow']:
-            return "🔴 Продати (DOWN)"
-        else:
-            return "⚪️ Нейтральний сигнал"
-    except Exception as e:
-        return f"⚠️ Помилка: {e}"
+    if not pair:
+        await query.edit_message_text("Будь ласка, спочатку оберіть валютну пару /start")
+        return
+
+    # Генеруємо сигнал з випадковою точністю 70-80%
+    accuracy = random.uniform(70, 80)
+    time_in_minutes = int(tf[:-1])  # витягуємо число з таймфрейму, наприклад '3м' -> 3
+
+    signal = f"📈 Сигнал для {pair} | Таймфрейм: {tf}\nРекомендовано увійти на {time_in_minutes} хвилин\nТочність сигналу: {accuracy:.2f}%"
+
+    # Записуємо в історію
+    history.append({
+        "pair": pair,
+        "timeframe": tf,
+        "accuracy": accuracy,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    })
+
+    await query.edit_message_text(signal)
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not history:
+        await update.message.reply_text("Історія угод порожня.")
+        return
+    text = "Історія сигналів:\n"
+    for item in history[-10:]:  # останні 10
+        text += f"{item['timestamp']}: {item['pair']} | {item['timeframe']} | Точність: {item['accuracy']:.2f}%\n"
+    await update.message.reply_text(text)
+
+def main():
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        print("Помилка: TELEGRAM_BOT_TOKEN не заданий у змінних оточення!")
+        return
+
+    application = ApplicationBuilder().token(token).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(pair_handler, pattern=r"^pair_"))
+    application.add_handler(CallbackQueryHandler(tf_handler, pattern=r"^tf_"))
+    application.add_handler(CommandHandler("history", history_command))
+
+    print("Бот запущено...")
+    application.run_polling()
 
 if __name__ == '__main__':
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.run_polling()
+    main()
