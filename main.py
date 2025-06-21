@@ -1,4 +1,4 @@
-import os
+impoimport os
 import logging
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
@@ -44,7 +44,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def get_signal(pair, tf):
     try:
-        df = yf.download(pair, period='1d', interval=tf)
+        df = yf.download(pair, period='5d', interval=tf)
+        if df.empty:
+            return "⚠️ Дані не доступні для цієї пари/таймфрейму. Спробуйте інший варіант."
         df.dropna(inplace=True)
         df['rsi'] = ta.momentum.RSIIndicator(df['Close']).rsi()
         df['ema_fast'] = ta.trend.EMAIndicator(df['Close'], window=5).ema_indicator()
