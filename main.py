@@ -74,10 +74,7 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 def main():
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        print("Помилка: TELEGRAM_BOT_TOKEN не заданий у змінних оточення!")
-        return
+    token = "8091244631:AAHZRqn2bY3Ow2zH2WNk0J92mar6D0MgfLw"
 
     application = ApplicationBuilder().token(token).build()
 
